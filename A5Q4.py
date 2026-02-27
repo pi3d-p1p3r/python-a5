@@ -1,190 +1,179 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import PolynomialFeatures
-from scipy.optimize import minimize # Using minimize for optimization instead of manual gradient descent for robustness
+from scipy.optimize import minimize
 
-# --- 1. Generate Dataset ---
-def generate_microchip_data(n_samples=118, noise_level=0.05, random_seed=42):
-    """
-    Generates a synthetic microchip dataset similar to those used in ML courses.
-    Features (X) are two test results, typically ranging from -1 to 1.
-    Labels (y) are 0 (fail) or 1 (pass).
-    The decision boundary is non-linear.
-    """
-    np.random.seed(random_seed)
-    X = np.random.rand(n_samples, 2) * 2 - 1  # Features between -1 and 1
+# ============================================================
+#  STEP 1: Generate Microchip Dataset
+#  - 2 test scores (features) with pass/fail labels
+#  - Non-linearly separable data
+# ============================================================
+def generate_data(n=118, seed=10):
+    np.random.seed(seed)
+    X = np.random.rand(n, 2) * 2 - 1  # scores between -1 and 1
 
-    # Create a complex, somewhat circular decision boundary
-    # y=1 if inside a combination of shapes, 0 otherwise
-    y = np.zeros(n_samples)
-    
-    # A more typical microchip-like boundary (e.g., two circles)
-    dist_sq_1 = X[:, 0]**2 + X[:, 1]**2
-    dist_sq_2 = (X[:, 0] - 0.2)**2 + (X[:, 1] + 0.4)**2 # Another center
-    
-    # Pass if within a certain radius of origin, but not too close, OR within another specific region
-    # This creates a more complex shape
-    condition1 = (dist_sq_1 < 0.7**2) & (dist_sq_1 > 0.2**2) 
-    condition2 = dist_sq_2 < 0.3**2
-    
-    y[(condition1) | (condition2)] = 1
-    
-    # Add some random noise to labels to make it non-perfectly separable
-    if noise_level > 0:
-        flip_indices = np.random.choice(n_samples, int(n_samples * noise_level), replace=False)
-        y[flip_indices] = 1 - y[flip_indices]
-        
-    return X, y.astype(int)
+    # Create a non-linear boundary (ring + blob shape)
+    r1 = X[:, 0]**2 + X[:, 1]**2
+    r2 = (X[:, 0] - 0.2)**2 + (X[:, 1] + 0.4)**2
 
-# --- Sigmoid function ---
+    y = np.zeros(n, dtype=int)
+    y[((r1 < 0.49) & (r1 > 0.04)) | (r2 < 0.09)] = 1  # pass
+
+    # Flip ~5% of labels so it's not perfectly separable
+    flip = np.random.choice(n, int(n * 0.05), replace=False)
+    y[flip] = 1 - y[flip]
+    return X, y
+
+
+# ============================================================
+#  STEP 2: Map Features to Polynomial Terms (up to degree 6)
+# ============================================================
+def map_features(X, degree=6):
+    mapper = PolynomialFeatures(degree=degree, include_bias=True)
+    X_poly = mapper.fit_transform(X)
+    return X_poly, mapper
+
+
+# ============================================================
+#  STEP 3: Sigmoid Function
+# ============================================================
 def sigmoid(z):
-    return 1 / (1 + np.exp(-z))
+    return 1.0 / (1.0 + np.exp(-z))
 
-# --- 2. Map Features ---
-# We will use sklearn's PolynomialFeatures.
-# For example, degree=2 for (x1, x2) gives (1, x1, x2, x1^2, x1*x2, x2^2)
 
-# --- 3. Implement Regularized Cost Function and Gradient ---
-def cost_function_reg(theta, X_poly, y, lambda_val):
+# ============================================================
+#  STEP 4: Regularized Cost Function
+#    J = -(1/m) * [y·log(h) + (1-y)·log(1-h)]
+#        + (λ / 2m) * Σθ_j²   (j = 1,2,...  skip θ₀)
+# ============================================================
+def cost(theta, X_poly, y, lam):
     m = len(y)
     h = sigmoid(X_poly @ theta)
-    
-    # Prevent log(0) issues
-    epsilon = 1e-7
-    h = np.clip(h, epsilon, 1 - epsilon)
-    
-    cost = (-1/m) * (y.T @ np.log(h) + (1-y).T @ np.log(1-h))
-    
-    # Regularization term (do not regularize theta[0])
-    reg_term = (lambda_val / (2*m)) * np.sum(theta[1:]**2)
-    
-    total_cost = cost + reg_term
-    return total_cost
+    h = np.clip(h, 1e-7, 1 - 1e-7)           # avoid log(0)
 
-def gradient_reg(theta, X_poly, y, lambda_val):
+    J = (-1 / m) * (y @ np.log(h) + (1 - y) @ np.log(1 - h))
+    J += (lam / (2 * m)) * np.sum(theta[1:]**2)  # regularization (skip θ₀)
+    return J
+
+
+# ============================================================
+#  STEP 5: Regularized Gradient
+#    ∂J/∂θ_j = (1/m) * Σ(h-y)·x_j  +  (λ/m)·θ_j   (j ≥ 1)
+#    ∂J/∂θ_0 = (1/m) * Σ(h-y)·x_0                   (no reg)
+# ============================================================
+def gradient(theta, X_poly, y, lam):
     m = len(y)
     h = sigmoid(X_poly @ theta)
-    
-    gradient = (1/m) * (X_poly.T @ (h - y))
-    
-    # Regularization term for gradient (do not regularize theta[0])
-    reg_grad_term = (lambda_val / m) * theta
-    reg_grad_term[0] = 0 # Don't regularize the bias term
-    
-    total_gradient = gradient + reg_grad_term
-    return total_gradient
 
-# --- 4. Plot Decision Boundaries (and data) ---
-def plot_decision_boundary(X, y, X_poly_mapper, theta, lambda_val, ax):
-    """
-    Plots the data points and the decision boundary.
-    X: original features (before polynomial mapping)
-    y: labels
-    X_poly_mapper: the PolynomialFeatures object used for mapping
-    theta: learned parameters
-    lambda_val: regularization parameter
-    ax: matplotlib axis object
-    """
-    # Plot data
-    ax.scatter(X[y==1, 0], X[y==1, 1], c='blue', marker='o', label='Pass (y=1)', edgecolors='k', alpha=0.7)
-    ax.scatter(X[y==0, 0], X[y==0, 1], c='red', marker='x', label='Fail (y=0)', s=50, alpha=0.7)
+    grad = (1 / m) * (X_poly.T @ (h - y))
+    reg = (lam / m) * theta
+    reg[0] = 0                                 # don't regularize θ₀
+    return grad + reg
 
-    # Create a grid of points to plot the decision boundary
-    u_min, u_max = X[:, 0].min() - 0.1, X[:, 0].max() + 0.1
-    v_min, v_max = X[:, 1].min() - 0.1, X[:, 1].max() + 0.1
-    u_vals = np.linspace(u_min, u_max, 100)
-    v_vals = np.linspace(v_min, v_max, 100)
-    
-    z = np.zeros((len(u_vals), len(v_vals)))
 
-    for i in range(len(u_vals)):
-        for j in range(len(v_vals)):
-            # Map the grid point to polynomial features
-            point_poly = X_poly_mapper.transform(np.array([[u_vals[i], v_vals[j]]]))
-            z[j, i] = point_poly @ theta # z = theta.T @ X_poly_point
+# ============================================================
+#  STEP 6: Train (Optimize θ) Using scipy.optimize.minimize
+# ============================================================
+def train(X_poly, y, lam):
+    theta0 = np.zeros(X_poly.shape[1])
+    res = minimize(cost, theta0,
+                   args=(X_poly, y, lam),
+                   method='TNC',
+                   jac=gradient,
+                   options={'maxfun': 400})
+    return res.x, res.fun
 
-    # Plot the contour z=0 (decision boundary)
-    ax.contour(u_vals, v_vals, z, levels=[0], linewidths=2, colors='green')
-    
-    ax.set_xlabel("Microchip Test 1 Score")
-    ax.set_ylabel("Microchip Test 2 Score")
-    ax.set_title(f"Decision Boundary (λ = {lambda_val})")
+
+# ============================================================
+#  STEP 7: Plot Decision Boundary
+# ============================================================
+def plot_boundary(X, y, mapper, theta, lam, ax):
+    # Scatter the data
+    ax.scatter(X[y == 1, 0], X[y == 1, 1],
+               c='blue', marker='o', label='Pass', edgecolors='k', alpha=0.7)
+    ax.scatter(X[y == 0, 0], X[y == 0, 1],
+               c='red', marker='x', label='Fail', s=50, alpha=0.7)
+
+    # Build a grid and evaluate θᵀx over it
+    u = np.linspace(X[:, 0].min() - 0.1, X[:, 0].max() + 0.1, 100)
+    v = np.linspace(X[:, 1].min() - 0.1, X[:, 1].max() + 0.1, 100)
+    z = np.zeros((len(v), len(u)))
+
+    for i in range(len(u)):
+        for j in range(len(v)):
+            point = mapper.transform([[u[i], v[j]]])
+            z[j, i] = (point @ theta).item()
+
+    # Shade prediction regions so they are always visible
+    ax.contourf(u, v, z, levels=[-1e10, 0, 1e10],
+                colors=['#ffcccc', '#ccccff'], alpha=0.3)
+
+    # Draw boundary line at z=0 (only if z spans both sides)
+    if z.min() < 0 < z.max():
+        ax.contour(u, v, z, levels=[0], linewidths=2, colors='green')
+
+    ax.set_xlabel("Test 1 Score")
+    ax.set_ylabel("Test 2 Score")
+    ax.set_title(f"lambda = {lam}")
     ax.legend(loc='upper right', fontsize='small')
     ax.grid(True, linestyle='--', alpha=0.6)
 
-# --- Main ---
+
+# ============================================================
+#  STEP 8: Main — Run Everything
+# ============================================================
 if __name__ == "__main__":
-    X_orig, y_orig = generate_microchip_data(n_samples=118, random_seed=10) # Seed for reproducibility
 
-    # Plot initial data
-    plt.figure(figsize=(7,6))
-    plt.scatter(X_orig[y_orig==1, 0], X_orig[y_orig==1, 1], c='blue', marker='o', label='Pass (y=1)', edgecolors='k', alpha=0.7)
-    plt.scatter(X_orig[y_orig==0, 0], X_orig[y_orig==0, 1], c='red', marker='x', label='Fail (y=0)', s=50, alpha=0.7)
-    plt.xlabel("Microchip Test 1 Score")
-    plt.ylabel("Microchip Test 2 Score")
-    plt.title("Microchip Test Results Data")
-    plt.legend()
-    plt.grid(True, linestyle='--', alpha=0.6)
-    plt.show()
+    # ---- 8a. Generate data ----
+    X, y = generate_data()
 
-    # --- Task 1: Map features into polynomial terms (up to 6th degree) ---
-    poly_degree = 6
-    # include_bias=True adds a column of ones for the intercept term.
-    # This means theta[0] will be the bias, and X_poly will have the intercept column.
-    poly_features_mapper = PolynomialFeatures(degree=poly_degree, include_bias=True)
-    X_poly = poly_features_mapper.fit_transform(X_orig)
-    
-    print(f"Original X shape: {X_orig.shape}")
-    print(f"Polynomial mapped X shape (degree {poly_degree}): {X_poly.shape}") # Should be (n_samples, n_poly_features)
+    # ---- 8b. Map to polynomial features (degree 6) ----
+    X_poly, mapper = map_features(X, degree=6)
+    print(f"Original shape : {X.shape}")
+    print(f"Poly-mapped shape: {X_poly.shape}")
 
-    # --- Task 2 & 3: Implement regularized cost/gradient and choose lambda values ---
-    lambda_values = [0, 1, 100] # Regularization parameters to test
-    
-    # Prepare subplots for decision boundaries
-    num_lambdas = len(lambda_values)
-    fig, axes = plt.subplots(1, num_lambdas, figsize=(7 * num_lambdas, 6), sharey=True)
-    if num_lambdas == 1: # Make axes iterable even if only one subplot
-        axes = [axes]
+    # ---- 8c. Choose λ values and train ----
+    lambdas = [0, 1, 100]   # lambda values to compare
+    fig, axes = plt.subplots(1, 3, figsize=(21, 6), sharey=True)
 
-    print("\nTraining models with different lambda values:")
-    for i, lambda_val in enumerate(lambda_values):
-        print(f"\n--- Training for λ = {lambda_val} ---")
-        
-        # Initialize theta
-        initial_theta = np.zeros(X_poly.shape[1])
-        
-        # Optimize theta using scipy.optimize.minimize
-        # This is generally more robust than manual gradient descent for complex problems.
-        # We provide the cost function and the gradient (jac=jacobian).
-        # 'TNC' or 'BFGS' are good methods for this type of problem.
-        options = {'maxiter': 400} # Can increase if needed
-        result = minimize(cost_function_reg, 
-                          initial_theta, 
-                          args=(X_poly, y_orig, lambda_val), 
-                          method='TNC', # or 'BFGS', 'L-BFGS-B'
-                          jac=gradient_reg, 
-                          options=options)
-        
-        optimal_theta = result.x
-        final_cost = result.fun
-        
-        print(f"Optimization successful: {result.success}")
-        print(f"Final cost: {final_cost:.4f}")
-        # print(f"Optimal theta (first 5 elements): {optimal_theta[:5]}")
+    for i, lam in enumerate(lambdas):
+        theta, final_cost = train(X_poly, y, lam)
 
-        # --- Task 4: Plot the decision boundaries ---
-        plot_decision_boundary(X_orig, y_orig, poly_features_mapper, optimal_theta, lambda_val, axes[i])
+        # Training accuracy
+        preds = (sigmoid(X_poly @ theta) >= 0.5).astype(int)
+        acc = np.mean(preds == y) * 100
 
-        # Calculate accuracy on the training set
-        predictions_prob = sigmoid(X_poly @ optimal_theta)
-        predictions = (predictions_prob >= 0.5).astype(int)
-        accuracy = np.mean(predictions == y_orig) * 100
-        axes[i].text(0.05, 0.05, f'Accuracy: {accuracy:.2f}%', transform=axes[i].transAxes, 
-                     fontsize=10, bbox=dict(boxstyle='round,pad=0.3', fc='wheat', alpha=0.7))
-        print(f"Training Accuracy: {accuracy:.2f}%")
+        print(f"\nlambda = {lam:>3}  |  Cost = {final_cost:.4f}  |  Accuracy = {acc:.2f}%")
 
+        # ---- 8d. Plot decision boundary ----
+        plot_boundary(X, y, mapper, theta, lam, axes[i])
+        axes[i].text(0.05, 0.05, f'Acc: {acc:.1f}%',
+                     transform=axes[i].transAxes, fontsize=10,
+                     bbox=dict(boxstyle='round', fc='wheat', alpha=0.7))
+
+    plt.suptitle("Regularization in Logistic Regression — Decision Boundaries",
+                 fontsize=14, fontweight='bold')
     plt.tight_layout()
-    plt.savefig("regularized_logistic_regression_boundaries.png")
+    plt.savefig("regularization_results.png")
     plt.show()
 
-    
+    # ---- 8e. Discussion ----
+    print("\n" + "=" * 60)
+    print("DISCUSSION - Effect of lambda on Underfitting / Overfitting")
+    print("=" * 60)
+    print("""
+lambda = 0   (No regularization)
+  - The model tries to fit every data point.
+  - Decision boundary is very complex (wiggly).
+  - HIGH VARIANCE -> OVERFITTING.
+
+lambda = 1   (Moderate regularization)
+  - Balances fitting the data vs. keeping theta small.
+  - Smooth, reasonable decision boundary.
+  - GOOD GENERALIZATION (best trade-off).
+
+lambda = 100 (Heavy regularization)
+  - Theta values are pushed very close to zero.
+  - Decision boundary is nearly a straight line (too simple).
+  - HIGH BIAS -> UNDERFITTING.
+""")
